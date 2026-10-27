@@ -96,7 +96,7 @@ services:
   # MinIO: almacenamiento de objetos (bronze / silver / gold)
   # ---------------------------------------------------------
   minio:
-    image: quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z
+    image: rancher/mirrored-minio-minio:RELEASE.2023-07-07T07-13-57Z-amd64
     container_name: sismowatch-minio
     command: server /data --console-address ":9001"
     environment:
@@ -108,14 +108,14 @@ services:
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 15
     restart: unless-stopped
 
   minio-init:
-    image: quay.io/minio/aistor/mc:RELEASE.2026-09-19T15-24-59Z
+    image: rancher/mirrored-minio-mc:RELEASE.2023-06-28T21-54-17Z-amd64
     container_name: sismowatch-minio-init
     depends_on:
       minio:
@@ -134,11 +134,16 @@ services:
   spark-master:
     image: apache/spark:3.5.1
     container_name: sismowatch-spark-master
-    command: ["master"]
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
     environment:
-      SPARK_MASTER_HOST: spark-master
-      SPARK_MASTER_WEBUI_PORT: "8080"
-      SPARK_MASTER_PORT: "7077"
       SPARK_NO_DAEMONIZE: "true"
     ports:
       - "7077:7077"
@@ -156,12 +161,17 @@ services:
   spark-worker:
     image: apache/spark:3.5.1
     container_name: sismowatch-spark-worker
-    command: ["worker"]
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "2"
+      - --memory
+      - 1g
+      - --webui-port
+      - "8081"
     environment:
-      SPARK_MASTER: spark://spark-master:7077
-      SPARK_WORKER_CORES: "2"
-      SPARK_WORKER_MEMORY: 1g
-      SPARK_WORKER_WEBUI_PORT: "8081"
       SPARK_NO_DAEMONIZE: "true"
     ports:
       - "8092:8081"
@@ -274,7 +284,7 @@ services:
     environment:
       VITE_API_URL: ${VITE_API_URL:-http://localhost:8010}
     ports:
-      - "3000:5173"
+      - "3010:5173"
     restart: unless-stopped
     depends_on:
       api:

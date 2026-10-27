@@ -71,7 +71,7 @@ pipeline).
    │ catálogo · linaje ·      │◀─ publicación ──┐│                             ▼
    │ pipelines · containers   │ (dag_metadata)  ▼                    ┌──────────────┐
    └──────────────────────────┘   ┌─────────────┐                    │ Web React+TS │
-                                  │ Ollama local│◀───────▶───────────│ (:3000)      │
+                                  │ Ollama local│◀───────▶───────────│ (:3010)      │
                                   │ (IA, :11434)│                    └──────────────┘
                                   └─────────────┘
 ```

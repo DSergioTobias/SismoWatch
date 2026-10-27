@@ -36,7 +36,7 @@ propósito, diagrama de componentes, modelo de datos, decisiones y trade-offs.
 
 - Docker 24+ y Docker Compose v2
 - Ollama corriendo en el host (`http://localhost:11434`) con `llama3.2`
-- Puertos libres: `8090, 8010, 3000, 5435, 9000, 9001, 8585, 9200, 3307, 7077, 8091, 8092`
+- Puertos libres: `8090, 8010, 3010, 5435, 9000, 9001, 8585, 9200, 3307, 7077, 8091, 8092`
 
 ---
 
@@ -52,7 +52,7 @@ Servicios:
 
 | Servicio | URL |
 |---|---|
-| Plataforma web | http://localhost:3000 |
+| Plataforma web | http://localhost:3010 |
 | API (documentación) | http://localhost:8010/docs |
 | Airflow | http://localhost:8090 (credenciales del `.env`) |
 | OpenMetadata | http://localhost:8585 (credenciales del `.env`) |
