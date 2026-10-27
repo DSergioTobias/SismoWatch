@@ -1,4 +1,4 @@
-"""Cliente HTTP de la plataforma: JWT, manejo de errores y tipos."""
+// Cliente HTTP de la plataforma: JWT, manejo de errores y tipos.
 const API_URL = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8010'
 
 export interface Kpis {

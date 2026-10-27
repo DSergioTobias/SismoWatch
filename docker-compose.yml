@@ -4,7 +4,7 @@
 # PostgreSQL (serving) + FastAPI/React (plataforma)
 #
 # Uso:  cp .env.example .env && docker compose up -d
-# Puertos: Airflow :8090 · API :8010 · Web :3000 · OpenMetadata :8585
+# Puertos: Airflow :8090 · API :8010 · Web :3010 · OpenMetadata :8585
 #          MinIO :9000/:9001 · Spark UI :8091 · PG :5435
 # ============================================================
 name: sismowatch
@@ -131,6 +131,7 @@ services:
   # Apache Spark: clúster standalone (master + worker)
   # ---------------------------------------------------------
   spark-master:
+    # Jobs 100% DataFrame API (sin UDFs Python): no se requiere Python en el worker
     image: apache/spark:3.5.1
     container_name: sismowatch-spark-master
     command:
@@ -158,6 +159,7 @@ services:
           memory: 768m
 
   spark-worker:
+    # Jobs 100% DataFrame API (sin UDFs Python): no se requiere Python en el worker
     image: apache/spark:3.5.1
     container_name: sismowatch-spark-worker
     command:
@@ -205,6 +207,13 @@ services:
           --conn-type spark \
           --conn-host "spark://spark-master" \
           --conn-port 7077 || true
+        # Grant SELECT en tablas de Airflow al rol sismo_reader
+        # (las tablas las acaba de crear la migración de arriba)
+        PGPASSWORD=${POSTGRES_PASSWORD:-postgres} psql \
+          -h ${SISMO_PG_HOST:-postgres} \
+          -U ${POSTGRES_USER:-postgres} \
+          -d ${SISMO_PG_DB:-sismowatch} \
+          -c "GRANT SELECT ON public.dag, public.dag_run TO sismo_reader;" || true
 
   airflow-webserver:
     <<: *airflow-common
@@ -250,7 +259,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-480}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3010}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@sismowatch.local}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
@@ -348,23 +357,50 @@ services:
           memory: 1g
     restart: unless-stopped
 
+  om-migrate:
+    image: openmetadata/server:1.4.6
+    container_name: sismowatch-om-migrate
+    environment:
+      DB_DRIVER_CLASS: com.mysql.cj.jdbc.Driver
+      DB_SCHEME: mysql
+      DB_USE_SSL: "false"
+      DB_USER_PASSWORD: ${OM_MYSQL_PASSWORD:-openmetadata_password}
+      DB_HOST: om-mysql
+      DB_PORT: "3306"
+      DB_USER: openmetadata_user
+      OM_DATABASE: openmetadata_db
+      JAVA_TOOL_OPTIONS: "-Xmx1536m -Xms256m"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        cd /opt/openmetadata && ./bootstrap/bootstrap_storage.sh migrate-all
+    depends_on:
+      om-mysql:
+        condition: service_healthy
+
   openmetadata:
     image: openmetadata/server:1.4.6
     container_name: sismowatch-openmetadata
     environment:
       DB_DRIVER_CLASS: com.mysql.cj.jdbc.Driver
-      DB_SCHEME: mysql+pymysql
+      DB_SCHEME: mysql
       DB_USE_SSL: "false"
-      MYSQL_USER_PASSWORD: ${OM_MYSQL_PASSWORD:-openmetadata_password}
-      MYSQL_HOST: om-mysql
-      MYSQL_PORT: "3306"
-      MYSQL_USER: openmetadata_user
-      MYSQL_DATABASE: openmetadata_db
+      DB_USER_PASSWORD: ${OM_MYSQL_PASSWORD:-openmetadata_password}
+      DB_HOST: om-mysql
+      DB_PORT: "3306"
+      DB_USER: openmetadata_user
+      OM_DATABASE: openmetadata_db
       ELASTICSEARCH_HOST: om-elasticsearch
       ELASTICSEARCH_PORT: "9200"
       SERVER_HOST_API_URL: http://openmetadata:8585/api
       AIRFLOW_HOST: airflow-webserver
       AIRFLOW_PORT: "8080"
+      PIPELINE_SERVICE_CLIENT_ENDPOINT: http://airflow-webserver:8080
+      AIRFLOW_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
+      AIRFLOW_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-}
+      # Heap acotado para no exceder el límite de memoria del contenedor
+      OPENMETADATA_HEAP_OPTS: -Xmx900m -Xms256m
     ports:
       - "8585:8585"
     depends_on:
@@ -372,6 +408,8 @@ services:
         condition: service_healthy
       om-elasticsearch:
         condition: service_healthy
+      om-migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8585/api/v1/system/version"]
       interval: 20s
@@ -381,7 +419,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1536m
+          memory: 2g
     restart: unless-stopped
 
 volumes:

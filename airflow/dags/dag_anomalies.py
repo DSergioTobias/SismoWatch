@@ -61,8 +61,9 @@ def deteccion_anomalias():
 
     @task
     def detect(series: list[dict]) -> list[dict]:
-        from ai.anomalies import detect_anomalies
-        return detect_anomalies(series)
+        from ai.anomalies import compute_hourly_series, detect_anomalies
+        hourly = compute_hourly_series(series)
+        return detect_anomalies(hourly)
 
     @task
     def explain(anomalies: list[dict]) -> list[dict]:

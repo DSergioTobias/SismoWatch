@@ -33,15 +33,14 @@ def read_bronze(spark: SparkSession, bronze_path: str) -> DataFrame:
     Cada objeto JSON de bronze es un ARRAY de eventos planos (escrito por
     el DAG de ingesta); spark.read.json devuelve una fila por elemento.
     """
-    df = (
+    return (
         spark.read
         .option("recursiveFileLookup", "true")
         .json(f"{bronze_path.rstrip('/')}/")
     )
-    return df
 
 
-def sanitize_text(col) -> "F.Column":
+def sanitize_text(col: str) -> "F.Column":
     """Equivalente Spark de include/transform.sanitize_text."""
     cleaned = F.regexp_replace(F.col(col).cast("string"), CONTROL_CHARS, " ")
     cleaned = F.regexp_replace(cleaned, r"\s+", " ")
@@ -60,24 +59,27 @@ def transform(df: DataFrame) -> DataFrame:
     lat = F.col("latitude").cast(T.DoubleType())
     depth = F.col("depth_km").cast(T.DoubleType())
 
-    # fechas: milisegundos epoch → timestamp UTC
-    event_ts = F.from_unixtime(F.col("event_time").cast(T.LongType()) / 1000.0)
-    updated_ts = F.when(F.col("updated_time").isNotNull(),
-                        F.from_unixtime(F.col("updated_time").cast(T.LongType()) / 1000.0))
+    # fechas: milisegundos epoch → timestamp UTC (from_unixtime devuelve
+    # string en Spark; se castea explícitamente a timestamp)
+    event_ts = (F.from_unixtime(F.col("event_time").cast(T.LongType()) / 1000.0)
+                .cast(T.TimestampType()))
+    updated_ts = F.when(
+        F.col("updated_time").isNotNull(),
+        (F.from_unixtime(F.col("updated_time").cast(T.LongType()) / 1000.0)
+         .cast(T.TimestampType())))
 
-    # tsunami → booleano (0/1, true/false, 'true'...)
-    tsunami = (
-        F.when(F.col("tsunami").cast("string").isin("1", "true", "True", "t"), True)
-        .when(F.col("tsunami").cast("string").isin("0", "false", "False", "f", ""), False)
-        .otherwise(None)
-    )
+    # tsunami → booleano (USGS manda 0/1)
+    tsunami_int = F.col("tsunami").cast(T.IntegerType())
+    tsunami = F.when(tsunami_int == 1, F.lit(True)).otherwise(F.lit(False))
 
     place = sanitize_text("place")
-    region_raw = F.when(
-        F.instr(place, ",") > 0,
-        F.trim(F.substring(place, F.instr(place, ",") + 1, 200)),
-    ).otherwise(place)
-    region = F.when(F.length(region_raw) == 0, F.lit("unknown")).otherwise(region_raw)
+    # región: texto tras la primera coma (via split de arrays, sin UDF)
+    parts = F.split(place, ",")
+    region_raw = F.trim(parts.getItem(1))
+    region = F.when(
+        region_raw.isNull() | (F.length(region_raw) == 0),
+        F.when(place.isNull(), F.lit("unknown")).otherwise(place),
+    ).otherwise(region_raw)
 
     return (
         df.select(
@@ -117,7 +119,7 @@ def main() -> None:
     silver.write.partitionBy("event_hour").mode("overwrite").parquet(
         f"{args.silver.rstrip('/')}/events")
     count = silver.count()
-    print(f"[bronze_to_silver] {count} filas → {args.silver}/events")
+    print(f"[bronze_to_silver] {count} filas → {args.silver.rstrip('/')}/events")
     spark.stop()
 
 

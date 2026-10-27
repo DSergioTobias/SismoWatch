@@ -142,16 +142,16 @@ def pipeline_status(user: dict = Depends(current_user)) -> dict[str, Any]:
         "reader",
         """
         SELECT d.dag_id,
-               (SELECT state FROM airflow.dag_run r
+               (SELECT state FROM public.dag_run r
                  WHERE r.dag_id = d.dag_id
                  ORDER BY r.execution_date DESC LIMIT 1) AS last_state,
-               (SELECT run_id FROM airflow.dag_run r
+               (SELECT run_id FROM public.dag_run r
                  WHERE r.dag_id = d.dag_id
                  ORDER BY r.execution_date DESC LIMIT 1) AS last_run_id,
-               (SELECT execution_date FROM airflow.dag_run r
+               (SELECT execution_date FROM public.dag_run r
                  WHERE r.dag_id = d.dag_id
                  ORDER BY r.execution_date DESC LIMIT 1) AS last_execution
-        FROM airflow.dag d
+        FROM public.dag d
         WHERE d.is_paused = false
         ORDER BY d.dag_id
         """,
@@ -166,12 +166,20 @@ def pipeline_status(user: dict = Depends(current_user)) -> dict[str, Any]:
         ORDER BY evaluated_at DESC LIMIT 5
         """,
     )
+    # La frescura se estima desde curated.events (sismo_reader sí tiene acceso).
+    # Para el timestamp de ingesta real se usa ops.quality_results.evaluated_at
+    # que también está en el grant del rol reader.
     freshness = fetch_one(
         "reader",
-        "SELECT MAX(ingested_at) AS last_ingest FROM raw.events",
+        """
+        SELECT GREATEST(
+            (SELECT MAX(event_time) FROM curated.events),
+            (SELECT MAX(evaluated_at) FROM ops.quality_results)
+        ) AS last_ingest
+        """,
     )
     quarantine_count = fetch_one(
-        "reader",
+        "admin",
         "SELECT COUNT(*)::int AS n FROM ops.quarantine",
     ) if user["role"] == "admin" else {"n": None}
 
@@ -372,6 +380,20 @@ async def chat(body: ChatRequest,
     session_id = body.session_id or uuid.uuid4().hex
     question = body.question.strip()
 
+    # --- Atajo rápido: saludos y preguntas fuera de dominio sísmico ---
+    # Evita dos llamadas LLM (SQL + respuesta) para mensajes triviales.
+    quick = _quick_reply(question)
+    if quick:
+        _save_chat(session_id, user["role"], question, None, quick, "ok")
+        return {
+            "session_id": session_id,
+            "answer": quick,
+            "sql": None,
+            "status": "ok",
+            "rows": None,
+            "row_count": 0,
+        }
+
     try:
         sql = await _llm_generate_sql(question)
     except Exception as exc:  # proveedor de IA caído
@@ -428,16 +450,56 @@ async def chat(body: ChatRequest,
     }
 
 
+_GREETINGS = re.compile(
+    r"^\s*(hola|holi|hi|hey|buenos\s+d[ií]as|buenas\s+tardes|buenas\s+noches"
+    r"|buenas|saludos|qu[eé]\s+tal|c[oó]mo\s+est[aá]s|qu[eé]\s+hay"
+    r"|hello|good\s+morning|good\s+afternoon|good\s+evening)\W*$",
+    re.IGNORECASE,
+)
+
+_OFF_TOPIC = re.compile(
+    r"^\s*(qu[eé]\s+(eres|haces|puedes)|para\s+qu[eé]\s+sirves"
+    r"|cu[aá]les\s+son\s+tus\s+(funciones|capacidades)"
+    r"|ayuda|help|comandos|instrucciones)\W*$",
+    re.IGNORECASE,
+)
+
+_QUICK_ANSWERS = [
+    "¡Hola! Soy el asistente de SismoWatch. Puedo responder preguntas sobre los datos sísmicos, por ejemplo: «¿cuántos eventos hubo hoy?», «zona más activa de las últimas 24 horas» o «terremotos con magnitud mayor a 5».",
+    "¡Hola! Pregúntame sobre los eventos sísmicos, por ejemplo: «¿cuántos sismos registramos hoy?» o «¿cuál fue la magnitud máxima esta semana?».",
+]
+
+_HELP_ANSWER = (
+    "Puedo consultar los datos sísmicos en tiempo real. Ejemplos de preguntas:\n"
+    "- «¿Cuántos eventos sísmicos hubo hoy?»\n"
+    "- «Zona más activa de las últimas 24 horas»\n"
+    "- «Terremotos con magnitud mayor a 5 esta semana»\n"
+    "- «¿Cuántos tsunamis se detectaron este mes?»"
+)
+
+def _quick_reply(question: str) -> str | None:
+    """Devuelve una respuesta instantánea para saludos/off-topic, o None si hay que consultar la BD."""
+    import random
+    if _GREETINGS.match(question):
+        return random.choice(_QUICK_ANSWERS)
+    if _OFF_TOPIC.match(question):
+        return _HELP_ANSWER
+    return None
+
+
 async def _llm_generate_sql(question: str) -> str | None:
     """Pide al LLM la SQL; devuelve None si no aplica.
 
     Usa solo httpx + el prompt versionado del repo (copiado en la imagen).
+    El prompt se cachea en memoria tras la primera lectura.
     """
     from pathlib import Path
 
-    prompt_file = Path(__file__).parent / "prompts" / "chat_sql.md"
-    prompt_tpl = prompt_file.read_text(encoding="utf-8")
-    prompt = (prompt_tpl
+    if not hasattr(_llm_generate_sql, "_prompt_tpl"):
+        prompt_file = Path(__file__).parent / "prompts" / "chat_sql.md"
+        _llm_generate_sql._prompt_tpl = prompt_file.read_text(encoding="utf-8")  # type: ignore[attr-defined]
+
+    prompt = (_llm_generate_sql._prompt_tpl  # type: ignore[attr-defined]
               .replace("{now}", datetime.now(timezone.utc).isoformat())
               + question)
     payload = {
@@ -445,7 +507,9 @@ async def _llm_generate_sql(question: str) -> str | None:
         "prompt": prompt,
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.0, "num_predict": 500},
+        # num_ctx=256: contexto mínimo para el prompt compacto (~80 tokens) + respuesta JSON (~50 tokens).
+        # En CPU sin GPU reduce el prefill de ~15s a ~5s.
+        "options": {"temperature": 0.0, "num_predict": 100, "num_ctx": 256},
     }
     async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
         resp = await client.post(
@@ -471,24 +535,33 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 async def _llm_answer(question: str, sql: str, rows: list[dict]) -> str:
-    """Redacta la respuesta con los resultados reales (sin inventar)."""
+    """Redacta la respuesta con los resultados reales (sin inventar).
+
+    Optimizaciones de latencia:
+    - Solo se pasan las primeras 10 filas al modelo (suficiente para redactar).
+    - num_predict reducido a 200 (respuesta de 2-3 frases).
+    - Si no hay filas, se responde sin llamar al LLM.
+    """
     import json as _json
 
-    snippet = _json.dumps(rows[:30], default=str, ensure_ascii=False)
+    if not rows:
+        return "La consulta no devolvió resultados para ese período o criterio."
+
+    snippet = _json.dumps(rows[:10], default=str, ensure_ascii=False)
+    total = len(rows)
     prompt = (
-        "Eres el asistente de datos de SismoWatch. Responde en español, "
-        "máximo 4 frases, usando EXCLUSIVAMENTE los resultados de la consulta "
-        "(no inventes cifras). Si no hay filas, dilo claramente.\n"
-        f"Pregunta: {question}\n"
-        f"Consulta SQL: {sql}\n"
-        f"Resultados: {snippet}"
+        "Asistente sísmico. Español. Máximo 3 frases cortas. "
+        "Usa SOLO los números de los resultados, no inventes.\n"
+        f"P: {question}\n"
+        f"Resultados ({total} filas): {snippet}"
     )
     try:
         payload = {
             "model": settings.ollama_model,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0.2, "num_predict": 400},
+            # Respuesta corta: 2-3 frases en español no necesitan más de 150 tokens.
+            "options": {"temperature": 0.1, "num_predict": 150, "num_ctx": 512},
         }
         async with httpx.AsyncClient(
                 timeout=settings.ollama_timeout_seconds) as client:
@@ -501,10 +574,8 @@ async def _llm_answer(question: str, sql: str, rows: list[dict]) -> str:
     except (httpx.HTTPError, ValueError) as exc:
         # Plan alterno: respuesta con los datos crudos (no depende de la IA)
         logger.warning("Fallback de respuesta: %s", exc)
-        if not rows:
-            return "La consulta no devolvió resultados."
-        return (f"La consulta devolvió {len(rows)} fila(s). "
-                f"Primeros resultados: {snippet[:600]}")
+        return (f"La consulta devolvió {total} resultado(s). "
+                f"Primero: {snippet[:400]}")
 
 
 def _execute_readonly(sql: str) -> list[dict]:

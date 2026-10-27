@@ -22,7 +22,7 @@ USGS (API pública) → Airflow (ingesta */5min)
    curated.events + curated.hourly_activity (PostgreSQL)
         │  Spark → s3://gold (agregados)
         ▼
-   FastAPI (:8010, JWT + roles) ← React (:3000, dashboard + chatbot + SSE)
+   FastAPI (:8010, JWT + roles) ← React (:3010, dashboard + chatbot + SSE)
         │
         └─ OpenMetadata (:8585): catálogo, pipelines, linaje
 ```
@@ -155,5 +155,7 @@ Añadir una fuente nueva **sin tocar el pipeline**: insertar una fila en
   habilitado (best-effort).
 - Usuarios de la plataforma sembrados en memoria desde `.env`; en
   producción irían a una tabla con hash y refresh tokens.
+- Los permisos sobre `public.dag` / `public.dag_run` para `sismo_reader`
+  se cubren con `ALTER DEFAULT PRIVILEGES` (tablas creadas tras el init).
 - Ver sección "Qué haría diferente en producción" en
   [docs/ARQUITECTURA.md](docs/ARQUITECTURA.md).

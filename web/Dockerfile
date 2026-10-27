@@ -12,6 +12,6 @@ COPY . .
 
 EXPOSE 5173
 HEALTHCHECK --interval=15s --timeout=10s --retries=10 \
-    CMD wget -q -O /dev/null http://localhost:5173 || exit 1
+    CMD wget -q -O /dev/null http://127.0.0.1:5173 || exit 1
 
 CMD ["npm", "run", "dev"]

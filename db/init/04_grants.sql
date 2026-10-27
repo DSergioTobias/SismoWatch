@@ -23,7 +23,7 @@ GRANT INSERT, SELECT ON ops.quality_results TO sismo_transform;
 GRANT INSERT, SELECT ON ops.quarantine TO sismo_transform;
 GRANT INSERT, SELECT ON ops.ai_runs TO sismo_transform;
 GRANT INSERT, SELECT ON ops.metadata_runs TO sismo_transform;
-GRANT INSERT, UPDATE ON ops.reports TO sismo_transform;
+GRANT INSERT, SELECT, UPDATE ON ops.reports TO sismo_transform;
 GRANT INSERT, SELECT ON ops.anomalies TO sismo_transform;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA staging TO sismo_transform;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA curated TO sismo_transform;
@@ -34,10 +34,21 @@ GRANT SELECT ON curated.events, curated.hourly_activity TO sismo_reader;
 GRANT INSERT ON ops.chat_messages TO sismo_reader;   -- historial del chatbot
 GRANT SELECT ON ops.quality_results, ops.reports, ops.anomalies,
                ops.ai_runs, ops.sources TO sismo_reader;
--- Estado del pipeline: tablas de metadatos de Airflow (creadas después;
--- se autorizan por default privileges para tablas futuras del esquema public)
+-- Estado del pipeline: tablas de metadatos de Airflow residen en public
+-- (Airflow usa el esquema public por defecto en la misma BD).
+-- El ALTER DEFAULT PRIVILEGES cubre tablas futuras; los GRANT explícitos
+-- cubren las tablas ya existentes cuando este script se aplica después de airflow-init.
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
     GRANT SELECT ON TABLES TO sismo_reader;
+-- GRANT explícito por si las tablas de Airflow ya existían al ejecutar este script:
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = 'public' AND table_name = 'dag') THEN
+        GRANT SELECT ON public.dag, public.dag_run TO sismo_reader;
+    END IF;
+END;
+$$;
 
 -- ---------- sismo_admin: además de lo anterior, cuarentena y chat ----------
 GRANT SELECT ON ops.quarantine, ops.chat_messages TO sismo_admin;

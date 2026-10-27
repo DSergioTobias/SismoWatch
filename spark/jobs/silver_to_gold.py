@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
 
@@ -33,6 +33,14 @@ def main() -> None:
     spark = build_spark()
 
     events = spark.read.parquet(f"{args.silver.rstrip('/')}/events")
+    # el feed repite eventos en cada corrida de ingesta: dedupe por
+    # (source_id, event_uid) conservando la versión más reciente
+    events = (events
+              .withColumn("_rn", F.row_number().over(
+                  Window.partitionBy("source_id", "event_uid")
+                  .orderBy(F.desc("event_time"))))
+              .filter(F.col("_rn") == 1)
+              .drop("_rn"))
     events = events.filter(
         F.col("event_time") >= F.expr(f"current_timestamp() - interval {args.days} days")
     )

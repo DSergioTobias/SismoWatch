@@ -60,7 +60,7 @@ CREATE INDEX IF NOT EXISTS idx_staging_region ON staging.events (region);
 CREATE TABLE IF NOT EXISTS curated.events (
     source_id       text NOT NULL,
     event_uid       text NOT NULL,
-    mag             numeric(4,2) NOT NULL,
+    mag             numeric(4,2),             -- NULL permitido: algunos feeds no reportan magnitud
     place           text,
     region          text NOT NULL DEFAULT 'unknown',
     event_time      timestamptz NOT NULL,

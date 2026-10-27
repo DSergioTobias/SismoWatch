@@ -133,23 +133,53 @@ def backfill_historico():
         return len(rows)
 
     @task
-    def run_transform() -> None:
-        """Dispara la transformación sobre los datos históricos recién cargados."""
-        from db import execute
-        # se marca el rango para que transformacion_calidad lo tome;
-        # en la práctica el DAG de transformación se lanza por schedule/trigger.
-        execute("transform",
-                "INSERT INTO ops.quality_results "
-                "(dag_run_id, source_id, rules_evaluated, rules_passed, "
-                " rules_rejected, records_total, records_valid, records_rejected, "
-                " score, status, details) "
-                "VALUES (%s, 'usgs_feed', 0, 0, 0, 0, 0, 0, 100, 'backfill_ok', "
-                " %s::jsonb)",
-                ("backfill", json.dumps({"note": "backfill completado"})))
+    def run_transform(count: int) -> dict:
+        """Dispara el DAG de transformación sobre los datos históricos recién cargados.
+
+        Si no hay eventos nuevos, omite el trigger para no generar ejecuciones vacías.
+        Si Airflow no está disponible, registra la advertencia pero no falla el backfill
+        (los datos ya están en raw; el scheduler lanzará la transformación en el
+        siguiente ciclo normal).
+        """
+        import os
+
+        import httpx
+
+        if count == 0:
+            logger.info("Sin eventos cargados; se omite el trigger de transformación")
+            return {"triggered": False, "reason": "no_events"}
+
+        base = os.environ.get("AIRFLOW__API__BASE_URL",
+                              "http://localhost:8080")
+        user = os.environ.get("_AIRFLOW_WWW_USER_USERNAME", "admin")
+        password = os.environ.get("_AIRFLOW_WWW_USER_PASSWORD", "")
+        try:
+            with httpx.Client(timeout=15, auth=(user, password)) as client:
+                resp = client.post(
+                    f"{base}/api/v1/dags/transformacion_calidad/dagRuns",
+                    json={"conf": {"triggered_by": "backfill_historico"}},
+                )
+            if resp.status_code in (200, 201):
+                run_id = resp.json().get("dag_run_id", "unknown")
+                logger.info("transformacion_calidad disparado: run_id=%s", run_id)
+                return {"triggered": True, "run_id": run_id}
+            if resp.status_code == 409:
+                logger.info("transformacion_calidad ya está en ejecución")
+                return {"triggered": False, "reason": "already_running"}
+            logger.warning(
+                "No se pudo disparar transformacion_calidad: HTTP %s — %s",
+                resp.status_code, resp.text[:200],
+            )
+            return {"triggered": False, "reason": f"http_{resp.status_code}"}
+        except httpx.HTTPError as exc:
+            # No fallamos el backfill: los datos están en raw y el scheduler
+            # procesará el Dataset sismowatch/raw/events en el siguiente ciclo.
+            logger.warning("Airflow API no disponible para trigger: %s", exc)
+            return {"triggered": False, "reason": str(exc)}
 
     params = fetch_params()
     count = load_history(params)
-    run_transform()
+    run_transform(count)
 
 
 backfill_historico()
