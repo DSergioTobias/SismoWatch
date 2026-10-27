@@ -59,7 +59,7 @@ def publicar_metadatos():
     def publish() -> dict:
         from db import execute
         from om_client import OMError, publish_catalog
-        from airflow.utils.session import get_current_context
+        from airflow.operators.python import get_current_context
 
         try:
             steps = publish_catalog()

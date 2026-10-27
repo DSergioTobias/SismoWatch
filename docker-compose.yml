@@ -20,7 +20,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "False"
-    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session_auth"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
     AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
     # Los módulos de include/ se importan como paquetes top-level
     PYTHONPATH: /opt/airflow/include:/opt/airflow/dags
@@ -46,7 +46,6 @@ x-airflow-common: &airflow-common
     MINIO_SECURE: "0"
     MINIO_BUCKETS: bronze,silver,gold
     # --- Spark standalone ---
-    AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
     SPARK_MASTER_URL: spark://spark-master:7077
     # --- OpenMetadata ---
     OM_API_URL: http://openmetadata:8585/api
@@ -199,8 +198,13 @@ services:
     command:
       - -c
       - |
+        set -e
         mkdir -p /opt/airflow/logs /opt/airflow/data
-        exec /entrypoint airflow version
+        /entrypoint airflow version
+        airflow connections add spark_default \
+          --conn-type spark \
+          --conn-host "spark://spark-master" \
+          --conn-port 7077 || true
 
   airflow-webserver:
     <<: *airflow-common
@@ -351,10 +355,11 @@ services:
       DB_DRIVER_CLASS: com.mysql.cj.jdbc.Driver
       DB_SCHEME: mysql+pymysql
       DB_USE_SSL: "false"
-      DB_USER_PASSWORD: ${OM_MYSQL_PASSWORD:-openmetadata_password}
-      DB_HOST: om-mysql
-      DB_USER: openmetadata_user
-      OM_DATABASE: openmetadata_db
+      MYSQL_USER_PASSWORD: ${OM_MYSQL_PASSWORD:-openmetadata_password}
+      MYSQL_HOST: om-mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: openmetadata_user
+      MYSQL_DATABASE: openmetadata_db
       ELASTICSEARCH_HOST: om-elasticsearch
       ELASTICSEARCH_PORT: "9200"
       SERVER_HOST_API_URL: http://openmetadata:8585/api

@@ -28,12 +28,16 @@ def build_spark() -> SparkSession:
 
 
 def read_bronze(spark: SparkSession, bronze_path: str) -> DataFrame:
-    """Lee todos los .json de bronze.
+    """Lee todos los .json de bronze (recursivo, partición hive dt=...).
 
     Cada objeto JSON de bronze es un ARRAY de eventos planos (escrito por
     el DAG de ingesta); spark.read.json devuelve una fila por elemento.
     """
-    df = spark.read.json(f"{bronze_path.rstrip('/')}/**/*.json")
+    df = (
+        spark.read
+        .option("recursiveFileLookup", "true")
+        .json(f"{bronze_path.rstrip('/')}/")
+    )
     return df
 
 

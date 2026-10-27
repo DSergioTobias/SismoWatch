@@ -19,10 +19,11 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from airflow.datasets import Dataset
-from airflow.decorators import dag, task, task_group
+from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
-from airflow.utils.session import get_current_context
+from airflow.utils.task_group import TaskGroup
+from airflow.operators.python import get_current_context
 from airflow.utils.trigger_rule import TriggerRule
 
 from callbacks import on_failure_alert
@@ -85,10 +86,10 @@ SPARK_CONF = {
 )
 def transformacion_calidad():
 
-    tg_spark = task_group("spark")
-    tg_calidad = task_group("calidad")
-    tg_gold = task_group("gold")
-    tg_fallback = task_group("fallback")
+    tg_spark = TaskGroup("spark")
+    tg_calidad = TaskGroup("calidad")
+    tg_gold = TaskGroup("gold")
+    tg_fallback = TaskGroup("fallback")
 
     spark_bronze_to_silver = SparkSubmitOperator(
         task_id="spark_bronze_to_silver",

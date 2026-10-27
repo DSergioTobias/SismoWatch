@@ -55,7 +55,7 @@ def backfill_historico():
     def fetch_params() -> dict:
         ctx_params = {}
         try:
-            from airflow.utils.session import get_current_context
+            from airflow.operators.python import get_current_context
             ctx = get_current_context()
             ctx_params = ctx.get("params") or (ctx["dag_run"].conf or {})
         except Exception:  # noqa: BLE001 - lanzamiento manual sin contexto

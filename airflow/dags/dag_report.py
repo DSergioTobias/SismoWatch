@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
-from airflow.utils.session import get_current_context
+from airflow.operators.python import get_current_context
 
 from callbacks import on_failure_alert
 

@@ -8,7 +8,9 @@
 
 -- ---------- sismo_ingest: solo raw ----------
 GRANT SELECT ON ops.sources TO sismo_ingest;
-GRANT INSERT, UPDATE ON raw.events TO sismo_ingest;
+-- SELECT en raw.events es necesario para el WHERE del ON CONFLICT
+-- (comparar el payload_hash previo antes de actualizar)
+GRANT INSERT, UPDATE, SELECT ON raw.events TO sismo_ingest;
 GRANT USAGE, SELECT ON SEQUENCE raw.events_raw_id_seq TO sismo_ingest;
 
 -- ---------- sismo_transform: raw → staging → curated ----------
@@ -29,7 +31,7 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ops TO sismo_transform;
 
 -- ---------- sismo_reader: solo lectura (la plataforma usa este rol) ----------
 GRANT SELECT ON curated.events, curated.hourly_activity TO sismo_reader;
-GRANT INSERT ON ops.chat_messages TO sismo_reader;   # historial del chatbot
+GRANT INSERT ON ops.chat_messages TO sismo_reader;   -- historial del chatbot
 GRANT SELECT ON ops.quality_results, ops.reports, ops.anomalies,
                ops.ai_runs, ops.sources TO sismo_reader;
 -- Estado del pipeline: tablas de metadatos de Airflow (creadas después;

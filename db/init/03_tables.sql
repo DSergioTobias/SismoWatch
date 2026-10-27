@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS curated.events (
     longitude       numeric(9,6) NOT NULL,
     latitude        numeric(9,6) NOT NULL,
     depth_km        numeric(8,3),
-    published_date  date GENERATED ALWAYS AS (event_time::date) STORED,
+    published_date  date GENERATED ALWAYS AS ((event_time AT TIME ZONE 'UTC')::date) STORED,
     transformed_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (source_id, event_uid)
 );
