@@ -1,0 +1,378 @@
+# ============================================================
+# SismoWatch — Lakehouse: MinIO (storage) + Spark (proceso) +
+# OpenMetadata (catálogo) + Airflow (orquestación) +
+# PostgreSQL (serving) + FastAPI/React (plataforma)
+#
+# Uso:  cp .env.example .env && docker compose up -d
+# Puertos: Airflow :8090 · API :8010 · Web :3000 · OpenMetadata :8585
+#          MinIO :9000/:9001 · Spark UI :8091 · PG :5435
+# ============================================================
+name: sismowatch
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-sismowatch}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "False"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session_auth"
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+    # Los módulos de include/ se importan como paquetes top-level
+    PYTHONPATH: /opt/airflow/include:/opt/airflow/dags
+    # --- PostgreSQL del pipeline ---
+    SISMO_PG_HOST: postgres
+    SISMO_PG_PORT: "5432"
+    SISMO_PG_DB: ${POSTGRES_DB:-sismowatch}
+    SISMO_PG_USER_INGEST: sismo_ingest
+    SISMO_PG_USER_TRANSFORM: sismo_transform
+    SISMO_PG_USER_READER: sismo_reader
+    SISMO_PG_PASSWORD_INGEST: ${SISMO_PG_PASSWORD_INGEST:-ingest_secret_change_me}
+    SISMO_PG_PASSWORD_TRANSFORM: ${SISMO_PG_PASSWORD_TRANSFORM:-transform_secret_change_me}
+    SISMO_PG_PASSWORD_READER: ${SISMO_PG_PASSWORD_READER:-reader_secret_change_me}
+    # --- Ollama (IA local en el host) ---
+    OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+    OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-120}
+    AIRFLOW_ALERT_WEBHOOK_URL: ${AIRFLOW_ALERT_WEBHOOK_URL:-}
+    # --- MinIO (lakehouse: bronze/silver/gold) ---
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+    MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    MINIO_SECURE: "0"
+    MINIO_BUCKETS: bronze,silver,gold
+    # --- Spark standalone ---
+    AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
+    SPARK_MASTER_URL: spark://spark-master:7077
+    # --- OpenMetadata ---
+    OM_API_URL: http://openmetadata:8585/api
+    OM_USERNAME: ${OM_USERNAME:-admin@open-metadata.org}
+    OM_PASSWORD: ${OM_PASSWORD:-admin}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/include:/opt/airflow/include
+    - ./airflow/tests:/opt/airflow/tests
+    - ./spark/jobs:/opt/airflow/spark/jobs
+    - airflow-logs:/opt/airflow/logs
+    - airflow-data:/opt/airflow/data
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------
+  # PostgreSQL: serving (raw/staging/curated/ops) + metastore Airflow
+  # ---------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: sismowatch-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sismowatch}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      SISMO_PG_PASSWORD_INGEST: ${SISMO_PG_PASSWORD_INGEST:-ingest_secret_change_me}
+      SISMO_PG_PASSWORD_TRANSFORM: ${SISMO_PG_PASSWORD_TRANSFORM:-transform_secret_change_me}
+      SISMO_PG_PASSWORD_READER: ${SISMO_PG_PASSWORD_READER:-reader_secret_change_me}
+      SISMO_PG_PASSWORD_ADMIN: ${SISMO_PG_PASSWORD_ADMIN:-admin_secret_change_me}
+    ports:
+      - "${POSTGRES_PORT:-5435}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-sismowatch}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # ---------------------------------------------------------
+  # MinIO: almacenamiento de objetos (bronze / silver / gold)
+  # ---------------------------------------------------------
+  minio:
+    image: quay.io/minio/aistor/minio:RELEASE.2026-09-19T17-05-25Z
+    container_name: sismowatch-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  minio-init:
+    image: quay.io/minio/aistor/mc:RELEASE.2026-09-19T15-24-59Z
+    container_name: sismowatch-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb -p local/bronze local/silver local/gold;
+      echo 'Buckets creados: bronze, silver, gold';
+      exit 0;
+      "
+
+  # ---------------------------------------------------------
+  # Apache Spark: clúster standalone (master + worker)
+  # ---------------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: sismowatch-spark-master
+    command: ["master"]
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_WEBUI_PORT: "8080"
+      SPARK_MASTER_PORT: "7077"
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "7077:7077"
+      - "8091:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/json/', timeout=5)\" || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: sismowatch-spark-worker
+    command: ["worker"]
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_WORKER_WEBUI_PORT: "8081"
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "8092:8081"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1536m
+
+  # ---------------------------------------------------------
+  # Airflow
+  # ---------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: sismowatch-airflow-init
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "True"
+      _AIRFLOW_WWW_USER_CREATE: "True"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/data
+        exec /entrypoint airflow version
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: sismowatch-airflow-webserver
+    command: webserver
+    ports:
+      - "8090:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: sismowatch-airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------
+  # API de la plataforma (FastAPI)
+  # ---------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: sismowatch-api
+    environment:
+      SISMO_PG_HOST: postgres
+      SISMO_PG_PORT: "5432"
+      SISMO_PG_DB: ${POSTGRES_DB:-sismowatch}
+      SISMO_PG_USER_READER: sismo_reader
+      SISMO_PG_PASSWORD_READER: ${SISMO_PG_PASSWORD_READER:-reader_secret_change_me}
+      SISMO_PG_USER_ADMIN: sismo_admin
+      SISMO_PG_PASSWORD_ADMIN: ${SISMO_PG_PASSWORD_ADMIN:-admin_secret_change_me}
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-480}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@sismowatch.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      VIEWER_EMAIL: ${VIEWER_EMAIL:-viewer@sismowatch.local}
+      VIEWER_PASSWORD: ${VIEWER_PASSWORD:-}
+      VIEWER_USERNAME: ${VIEWER_USERNAME:-viewer}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-120}
+      AIRFLOW_API_URL: http://airflow-webserver:8080
+      AIRFLOW_ADMIN_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-}
+    ports:
+      - "8010:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------------------------------------------------------
+  # Frontend (React + TypeScript + Vite)
+  # ---------------------------------------------------------
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: sismowatch-web
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8010}
+    ports:
+      - "3000:5173"
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+
+  # ---------------------------------------------------------
+  # OpenMetadata: MySQL + Elasticsearch + servidor + ingestion
+  # ---------------------------------------------------------
+  om-mysql:
+    image: mysql:8.4
+    container_name: sismowatch-om-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${OM_MYSQL_ROOT_PASSWORD:-openmetadata_root}
+      MYSQL_USER: openmetadata_user
+      MYSQL_PASSWORD: ${OM_MYSQL_PASSWORD:-openmetadata_password}
+      MYSQL_DATABASE: openmetadata_db
+    ports:
+      - "3307:3306"
+    volumes:
+      - om-mysql-data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uopenmetadata_user", "-p${OM_MYSQL_PASSWORD:-openmetadata_password}"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+    restart: unless-stopped
+
+  om-elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.2
+    container_name: sismowatch-om-es
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - om-es-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: unless-stopped
+
+  openmetadata:
+    image: openmetadata/server:1.4.6
+    container_name: sismowatch-openmetadata
+    environment:
+      DB_DRIVER_CLASS: com.mysql.cj.jdbc.Driver
+      DB_SCHEME: mysql+pymysql
+      DB_USE_SSL: "false"
+      DB_USER_PASSWORD: ${OM_MYSQL_PASSWORD:-openmetadata_password}
+      DB_HOST: om-mysql
+      DB_USER: openmetadata_user
+      OM_DATABASE: openmetadata_db
+      ELASTICSEARCH_HOST: om-elasticsearch
+      ELASTICSEARCH_PORT: "9200"
+      SERVER_HOST_API_URL: http://openmetadata:8585/api
+      AIRFLOW_HOST: airflow-webserver
+      AIRFLOW_PORT: "8080"
+    ports:
+      - "8585:8585"
+    depends_on:
+      om-mysql:
+        condition: service_healthy
+      om-elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8585/api/v1/system/version"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 1536m
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  airflow-data:
+  airflow-logs:
+  minio-data:
+  om-mysql-data:
+  om-es-data:
